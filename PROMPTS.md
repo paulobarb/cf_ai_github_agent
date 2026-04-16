@@ -1,0 +1,4 @@
+# AI Prompting Log
+
+---
+
