@@ -1,232 +1,192 @@
 import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
-import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
-import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText,
-  tool,
-  type ModelMessage
-} from "ai";
-import { z } from "zod";
+import { Agent, routeAgentRequest } from "agents";
+import { generateText } from "ai";
+import { AI_MODEL, SYSTEM_PROMPT } from "./config";
+import type { Env, GitHubPRMetadata } from "./types";
 
-/**
- * The AI SDK's downloadAssets step runs `new URL(data)` on every file
- * part's string data. Data URIs parse as valid URLs, so it tries to
- * HTTP-fetch them and fails. Decode to Uint8Array so the SDK treats
- * them as inline data instead.
- */
-function inlineDataUrls(messages: ModelMessage[]): ModelMessage[] {
-  return messages.map((msg) => {
-    if (msg.role !== "user" || typeof msg.content === "string") return msg;
-    return {
-      ...msg,
-      content: msg.content.map((part) => {
-        if (part.type !== "file" || typeof part.data !== "string") return part;
-        const match = part.data.match(/^data:([^;]+);base64,(.+)$/);
-        if (!match) return part;
-        const bytes = Uint8Array.from(atob(match[2]), (c) => c.charCodeAt(0));
-        return { ...part, data: bytes, mediaType: match[1] };
-      })
-    };
-  });
-}
+type AIRequestOptions = Parameters<typeof generateText>[0];
+type AIMessage = NonNullable<AIRequestOptions["messages"]>[number];
 
-export class ChatAgent extends AIChatAgent<Env> {
-  maxPersistedMessages = 100;
+type SecurityAgentAIRequest = AIRequestOptions & {
+  maxTokens?: number;
+};
 
-  onStart() {
-    // Configure OAuth popup behavior for MCP servers that require authentication
-    this.mcp.configureOAuthCallback({
-      customHandler: (result) => {
-        if (result.authSuccess) {
-          return new Response("<script>window.close();</script>", {
-            headers: { "content-type": "text/html" },
-            status: 200
-          });
-        }
-        return new Response(
-          `Authentication Failed: ${result.authError || "Unknown error"}`,
-          { headers: { "content-type": "text/plain" }, status: 400 }
+export class ChatAgent extends Agent<Env> {
+  /**
+   * WebSocket message handler.
+   * Path: WebSocket -> SQLite -> GitHub -> AI -> WebSocket.
+   */
+  async onMessage(
+    connection: { send: (s: string) => void },
+    wsMessage: string
+  ) {
+    try {
+      const data = JSON.parse(wsMessage);
+
+      if (data.type === "message") {
+        const userMessage = data.content as string;
+
+        // Persist user interaction to local Durable Object storage
+        this
+          .sql`CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT)`;
+        this
+          .sql`INSERT INTO chat_history (role, content) VALUES ('user', ${userMessage})`;
+
+        let enrichedPrompt = userMessage;
+
+        // Detect GitHub Pull Request URLs
+        const prMatch = userMessage.match(
+          /https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/
         );
+
+        if (prMatch) {
+          const prUrl = prMatch[0];
+          connection.send(
+            JSON.stringify({
+              type: "message",
+              content: "🔗 Detected GitHub PR Link! Fetching diff..."
+            })
+          );
+
+          try {
+            // Local Cache Check
+            this
+              .sql`CREATE TABLE IF NOT EXISTS pr_cache (url TEXT PRIMARY KEY, diff TEXT, title TEXT)`;
+            const cached = this.sql<{
+              diff: string;
+              title: string;
+            }>`SELECT diff, title FROM pr_cache WHERE url = ${prUrl}`;
+
+            let diff = "";
+            let title = "";
+
+            if (cached.length > 0) {
+              diff = cached[0].diff;
+              title = cached[0].title;
+            } else {
+              const urlPath = new URL(prUrl).pathname;
+              const match = urlPath.match(/\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+
+              if (!match) throw new Error("Invalid GitHub PR URL format");
+
+              const [, owner, repo, prNumber] = match;
+              const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
+
+              const [diffRes, metaRes] = await Promise.all([
+                fetch(apiUrl, {
+                  headers: {
+                    Accept: "application/vnd.github.v3.diff",
+                    Authorization: this.env.GITHUB_TOKEN
+                      ? `token ${this.env.GITHUB_TOKEN}`
+                      : "",
+                    "User-Agent": "AppSec-Agent"
+                  }
+                }),
+                fetch(apiUrl, {
+                  headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: this.env.GITHUB_TOKEN
+                      ? `token ${this.env.GITHUB_TOKEN}`
+                      : "",
+                    "User-Agent": "AppSec-Agent"
+                  }
+                })
+              ]);
+
+              if (!diffRes.ok)
+                throw new Error(`GitHub API returned ${diffRes.status}`);
+
+              diff = (await diffRes.text()).substring(0, 5000);
+              const prInfo = (await metaRes.json()) as GitHubPRMetadata;
+              title = prInfo.title;
+
+              this
+                .sql`INSERT OR REPLACE INTO pr_cache (url, diff, title) VALUES (${prUrl}, ${diff}, ${title})`;
+            }
+
+            enrichedPrompt = `User request: ${userMessage}\n\nAnalyze this PR Diff for OWASP vulnerabilities:\nPR Title: ${title}\n\n${diff}`;
+          } catch (e) {
+            const msg =
+              e instanceof Error ? e.message : "GitHub integration error";
+            connection.send(
+              JSON.stringify({
+                type: "message",
+                content: `🚨 Failed to read PR: ${msg}`
+              })
+            );
+            return;
+          }
+
+          connection.send(
+            JSON.stringify({
+              type: "message",
+              content: "⏳ *Analyzing PR code against OWASP guidelines...*"
+            })
+          );
+        } else {
+          connection.send(
+            JSON.stringify({
+              type: "message",
+              content: "⏳ *Thinking...*"
+            })
+          );
+        }
+
+        // Retrieve and format conversation history
+        const history = this.sql<{
+          role: "user" | "assistant";
+          content: string;
+        }>`SELECT role, content FROM chat_history`;
+
+        if (history.length > 0) {
+          history[history.length - 1].content = enrichedPrompt;
+        }
+
+        const messages: AIMessage[] = history.map((m) => ({
+          role: m.role,
+          content: m.content
+        }));
+
+        const workersai = createWorkersAI({ binding: this.env.AI });
+
+        try {
+          const result = await generateText({
+            model: workersai(AI_MODEL, {
+              sessionAffinity: this.ctx.id.toString()
+            }),
+            system: SYSTEM_PROMPT,
+            messages: messages,
+            maxTokens: 2048
+          } as unknown as SecurityAgentAIRequest);
+
+          const finalResponse =
+            result.text || "⚠️ AI was unable to generate a security report.";
+
+          this
+            .sql`INSERT INTO chat_history (role, content) VALUES ('assistant', ${finalResponse})`;
+          connection.send(
+            JSON.stringify({ type: "message", content: finalResponse })
+          );
+        } catch (aiError) {
+          const msg =
+            aiError instanceof Error ? aiError.message : "Inference failed";
+          connection.send(
+            JSON.stringify({
+              type: "message",
+              content: `🚨 **Backend Error:** ${msg}`
+            })
+          );
+        }
+        return;
       }
-    });
-  }
-
-  @callable()
-  async addServer(name: string, url: string) {
-    return await this.addMcpServer(name, url);
-  }
-
-  @callable()
-  async removeServer(serverId: string) {
-    await this.removeMcpServer(serverId);
-  }
-
-  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
-    const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
-
-    const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.5", {
-        sessionAffinity: this.sessionAffinity
-      }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
-
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls to save tokens on long conversations
-      messages: pruneMessages({
-        messages: inlineDataUrls(await convertToModelMessages(this.messages)),
-        toolCalls: "before-last-2-messages"
-      }),
-      tools: {
-        // MCP tools from connected servers
-        ...mcpTools,
-
-        // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
-        }),
-
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-        }),
-
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
-          }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
-            try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
-            } catch (error) {
-              return `Error scheduling task: ${error}`;
-            }
-          }
-        }),
-
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              return `Error cancelling task: ${error}`;
-            }
-          }
-        })
-      },
-      stopWhen: stepCountIs(5),
-      abortSignal: options?.abortSignal
-    });
-
-    return result.toUIMessageStreamResponse();
-  }
-
-  async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
-    console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
+    } catch (_e) {}
   }
 }
 
 export default {
   async fetch(request: Request, env: Env) {
-    return (
-      (await routeAgentRequest(request, env)) ||
-      new Response("Not found", { status: 404 })
-    );
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) return agentResponse;
+    return new Response("AppSec Agent is active.", { status: 200 });
   }
-} satisfies ExportedHandler<Env>;
+};
